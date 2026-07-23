@@ -9,11 +9,18 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
-const ACTOR_ID = "q6SGEKzFQuRiaEZU5";
+const ACTOR_ID = "caffein.dev~ebay-sold-listings";
 const LOOKBACK_DAYS = 30;
 
 const cache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
+
+function extractPrice(item) {
+  const raw = item.soldPrice ?? item.price ?? item.finalPrice;
+  if (raw == null) return NaN;
+  const cleaned = String(raw).replace(/[^0-9.]/g, "");
+  return parseFloat(cleaned);
+}
 
 async function fetchSoldComps(query) {
   const url = `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
@@ -21,14 +28,10 @@ async function fetchSoldComps(query) {
   const { data: items } = await axios.post(
     url,
     {
-      keyword: query,
-      count: 60,
+      keywords: [query],
       daysToScrape: LOOKBACK_DAYS,
-      ebaySite: "ebay.com",
-      itemLocation: "domestic",
-      itemCondition: "any",
     },
-    { timeout: 60000 }
+    { timeout: 90000 }
   );
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -38,10 +41,10 @@ async function fetchSoldComps(query) {
   const parsed = items
     .map((it) => ({
       title: it.title,
-      price: parseFloat(it.soldPrice),
-      soldAt: it.endedAt,
+      price: extractPrice(it),
+      soldAt: it.soldDate || it.endedAt,
     }))
-    .filter((it) => !isNaN(it.price));
+    .filter((it) => !isNaN(it.price) && it.price > 0);
 
   if (parsed.length === 0) {
     return { average: null, count: 0, items: [] };
