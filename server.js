@@ -17,10 +17,16 @@ const ACTOR_ID = "caffein.dev~ebay-sold-listings";
 
 const LOOKBACK_DAYS = 30;
 
-// Simple in-memory cache so repeated lookups of the same item within
-// 10 minutes don't cost another Apify run.
+// How many sold listings to pull per lookup. Fewer listings still give a
+// solid median and cost a lot less per search (pricing is per 1,000
+// results) - 25 is plenty for a reliable middle value.
+const RESULT_COUNT = 25;
+
+// Cache a lookup for a full day so the same item searched again by
+// another staff member (or re-searched by the same person) doesn't
+// trigger another paid run.
 const cache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function extractPrice(item) {
   const raw = item.soldPrice ?? item.price ?? item.finalPrice;
@@ -78,6 +84,7 @@ async function fetchSoldComps(query) {
   const body = {
     keywords: [query],
     daysToScrape: LOOKBACK_DAYS,
+    count: RESULT_COUNT,
     // Ask for a residential proxy if the actor supports it. Harmless if
     // it doesn't - unused fields are ignored by Apify actors.
     proxyConfiguration: {
@@ -148,7 +155,7 @@ async function waitForTurn() {
 }
 
 app.get("/api/comps", async (req, res) => {
-  const query = (req.query.q || "").trim();
+  const query = (req.query.q || "").trim().toLowerCase();
   if (!query) {
     return res.status(400).json({ error: "Missing query parameter q" });
   }
@@ -178,6 +185,45 @@ app.get("/api/comps", async (req, res) => {
       error:
         "Could not reach the comps service right now. Enter the sold value manually for this item.",
     });
+  }
+});
+
+// Gold/silver spot prices, for the jewelry scrap calculator. gold-api.com
+// is free, needs no API key, and has no rate limit - we still cache it
+// for an hour so we're not hitting it on every single calculation.
+const SPOT_CACHE_TTL_MS = 60 * 60 * 1000;
+let spotCache = null;
+let spotCacheAt = 0;
+
+async function fetchSpotPrices() {
+  const [goldRes, silverRes] = await Promise.all([
+    axios.get("https://api.gold-api.com/price/XAU", { timeout: 15000 }),
+    axios.get("https://api.gold-api.com/price/XAG", { timeout: 15000 }),
+  ]);
+  return {
+    gold: goldRes.data.price,
+    silver: silverRes.data.price,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+app.get("/api/spot", async (_req, res) => {
+  if (spotCache && Date.now() - spotCacheAt < SPOT_CACHE_TTL_MS) {
+    return res.json(spotCache);
+  }
+  try {
+    const result = await fetchSpotPrices();
+    spotCache = result;
+    spotCacheAt = Date.now();
+    res.json(result);
+  } catch (err) {
+    console.error("Spot price lookup failed:", err.message);
+    if (spotCache) {
+      // Serve the last known price rather than nothing if the spot
+      // source is briefly down.
+      return res.json(spotCache);
+    }
+    res.status(502).json({ error: "Could not reach the spot price service right now." });
   }
 });
 
