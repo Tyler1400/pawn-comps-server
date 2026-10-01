@@ -15,6 +15,14 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN;
 // The eBay Sold Listings actor on Apify (caffein.dev/ebay-sold-listings).
 const ACTOR_ID = "caffein.dev~ebay-sold-listings";
 
+// For gun retail price lookups: reads Academy Sports' own search index
+// directly (the same thing that powers academy.com's search box), not a
+// scraped page - more durable than typical scrapers, but newer/less
+// proven than the eBay actor above.
+const ACADEMY_ACTOR_ID = "crawlerbros~academy-sports-scraper";
+const GUN_RETAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const gunRetailCache = new Map();
+
 const LOOKBACK_DAYS = 30;
 
 // How many sold listings to pull per lookup. Fewer listings still give a
@@ -206,6 +214,67 @@ async function fetchSpotPrices() {
     updatedAt: new Date().toISOString(),
   };
 }
+
+async function fetchGunRetail(query) {
+  const url = `https://api.apify.com/v2/acts/${ACADEMY_ACTOR_ID}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+
+  const { data: items } = await axios.post(
+    url,
+    { mode: "search", searchQuery: query, maxItems: 5 },
+    { timeout: 60000 }
+  );
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return { found: false };
+  }
+
+  // Algolia ranks by relevance, so the first result with a usable price
+  // is almost always the right match. Still return the matched name so
+  // staff can eyeball it before trusting the number.
+  const match = items.find((it) => typeof it.price === "number" || !isNaN(parseFloat(it.price)));
+  if (!match) {
+    return { found: false };
+  }
+
+  return {
+    found: true,
+    name: match.name,
+    brand: match.brand,
+    retail: Math.round(parseFloat(match.price) * 100) / 100,
+  };
+}
+
+app.get("/api/gun-retail", async (req, res) => {
+  const query = (req.query.q || "").trim();
+  if (!query) {
+    return res.status(400).json({ error: "Missing query parameter q" });
+  }
+  if (!APIFY_TOKEN) {
+    return res.status(500).json({
+      error: "Server is missing its Apify token. Set APIFY_TOKEN in Render's environment settings.",
+    });
+  }
+
+  const cacheKey = query.toLowerCase();
+  const cached = gunRetailCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < GUN_RETAIL_CACHE_TTL_MS) {
+    return res.json(cached.data);
+  }
+
+  try {
+    const result = await fetchGunRetail(query);
+    gunRetailCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    res.json(result);
+  } catch (err) {
+    console.error(
+      "Gun retail lookup failed:",
+      err.response ? JSON.stringify(err.response.data) : err.message
+    );
+    res.status(502).json({
+      error: "Could not reach the retail price service right now. Enter the price manually for this item.",
+    });
+  }
+});
 
 app.get("/api/spot", async (_req, res) => {
   if (spotCache && Date.now() - spotCacheAt < SPOT_CACHE_TTL_MS) {
